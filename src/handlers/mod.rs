@@ -82,6 +82,7 @@ use crate::protocols::mutter_x11_interop::MutterX11InteropHandler;
 use crate::protocols::output_management::{OutputManagementHandler, OutputManagementManagerState};
 use crate::protocols::screencopy::{Screencopy, ScreencopyHandler, ScreencopyManagerState};
 use crate::utils::{output_size, send_scale_transform};
+use crate::niri::ImeCoordCache;
 
 pub const XDG_ACTIVATION_TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -110,6 +111,21 @@ impl SeatHandler for State {
         let client = focused.and_then(|s| dh.get_client(s.id()).ok());
         set_data_device_focus(dh, seat, client.clone());
         set_primary_focus(dh, seat, client);
+
+        if let Some(surface) = focused {
+            if let Some((mapped, _output)) = self.niri.layout.find_window_and_output(surface) {
+                let window_id = mapped.id();
+                let mut caches = self.ime_coord_caches.borrow_mut();
+                let cache = caches.entry(window_id).or_insert(ImeCoordCache {
+                    last_valid_rect: None,
+                    last_raw_rect: None,
+                    override_active: false,
+                });
+                cache.override_active = true;
+                cache.last_raw_rect = None;
+                debug!("[IME-Cache-Debug] >>> Focus Changed: override_active set to TRUE for Window ID: {:?}", window_id);
+            }
+        }
     }
 
     fn led_state_changed(&mut self, _seat: &Seat<Self>, led_state: keyboard::LedState) {

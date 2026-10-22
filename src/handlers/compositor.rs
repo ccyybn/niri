@@ -293,6 +293,10 @@ impl CompositorHandler for State {
                     self.niri
                         .stop_casts_for_target(CastTarget::Window { id: id.get() });
 
+                    if self.ime_coord_caches.borrow_mut().remove(&id).is_some() {
+                        debug!("[IME-Cache-Debug] Removed cache for Window ID: {:?} (via compositor)", id);
+                    }
+
                     self.niri.window_mru_ui.remove_window(id);
                     self.niri.layout.remove_window(&window, transaction.clone());
                     self.add_default_dmabuf_pre_commit_hook(surface);

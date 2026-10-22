@@ -196,6 +196,13 @@ use crate::utils::{
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
 
+#[derive(Clone, Debug)]
+pub struct ImeCoordCache {
+    pub last_valid_rect: Option<Rectangle<i32, Logical>>,
+    pub last_raw_rect: Option<Rectangle<i32, Logical>>,
+    pub override_active: bool,
+}
+
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 
 // We'll try to send frame callbacks at least once a second. We'll make a timer that fires once a
@@ -754,6 +761,7 @@ impl KeyboardFocus {
 pub struct State {
     pub backend: Backend,
     pub niri: Niri,
+    pub ime_coord_caches: RefCell<HashMap<MappedId, ImeCoordCache>>,
 }
 
 impl State {
@@ -797,7 +805,11 @@ impl State {
         );
         backend.init(&mut niri);
 
-        let mut state = Self { backend, niri };
+        let mut state = Self {
+            backend,
+            niri,
+            ime_coord_caches: RefCell::new(HashMap::new()),
+        };
 
         // Load the xkb_file config option if set by the user.
         state.load_xkb_file();

@@ -46,6 +46,8 @@ use crate::utils::{
     get_monotonic_time, output_matches_name, send_scale_transform, update_tiled_state, ResizeEdge,
 };
 use crate::window::{InitialConfigureState, ResolvedWindowRules, Unmapped, WindowRef};
+use crate::niri::ImeCoordCache;
+use crate::window::mapped::MappedId;
 
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -916,6 +918,10 @@ impl XdgShellHandler for State {
         let active_window = self.niri.layout.focus().map(|m| &m.window);
         let was_active = active_window == Some(&window);
 
+        if self.ime_coord_caches.borrow_mut().remove(&id).is_some() {
+            debug!("[IME-Cache-Debug] Removed cache for Window ID: {:?} (via XDG Shell toplevel_destroyed)", id);
+        }
+
         self.niri.window_mru_ui.remove_window(id);
         self.niri.layout.remove_window(&window, transaction.clone());
 
@@ -1293,7 +1299,8 @@ impl State {
 
         // Figure out if the root is a window or a layer surface.
         if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&root) {
-            self.unconstrain_window_popup(popup, &mapped.window);
+            let window_id = Some(mapped.id().clone());
+            self.unconstrain_window_popup(popup, &mapped.window, window_id);
         } else if let Some((layer_surface, output)) = self.niri.layout.outputs().find_map(|o| {
             let map = layer_map_for_output(o);
             let layer_surface = map.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)?;
@@ -1303,7 +1310,7 @@ impl State {
         }
     }
 
-    fn unconstrain_window_popup(&self, popup: &PopupKind, window: &Window) {
+    fn unconstrain_window_popup(&self, popup: &PopupKind, window: &Window, window_id: Option<MappedId>) {
         let ime = matches!(popup, PopupKind::InputMethod(_));
 
         // The target geometry for the positioner should be relative to its parent's geometry, so
@@ -1314,7 +1321,7 @@ impl State {
         let geo_off = window.geometry().loc.to_f64();
 
         // Don't add padding for IME popups; better to give them more space.
-        self.position_popup_within_rect(popup, geo_off, target, !ime);
+        self.position_popup_within_rect(popup, geo_off, target, !ime, window_id);
     }
 
     pub fn unconstrain_layer_shell_popup(
@@ -1352,7 +1359,7 @@ impl State {
         let geo_off = Point::new(0., 0.);
 
         // Don't add padding to layer-shell popups. It's not really needed, and it's unexpected.
-        self.position_popup_within_rect(popup, geo_off, target.to_f64(), false);
+        self.position_popup_within_rect(popup, geo_off, target.to_f64(), false, None);
     }
 
     fn position_popup_within_rect(
@@ -1361,6 +1368,7 @@ impl State {
         geo_off: Point<f64, Logical>,
         target: Rectangle<f64, Logical>,
         padding: bool,
+        window_id: Option<MappedId>,
     ) {
         match popup {
             PopupKind::Xdg(popup) => {
@@ -1380,7 +1388,67 @@ impl State {
                 let mut target = target;
                 target.loc += geo_off;
 
-                let text_input_rectangle = popup.text_input_rectangle();
+                let raw_rect = popup.text_input_rectangle();
+
+                let text_input_rectangle = if let Some(wid) = window_id {
+                    let mut caches = self.ime_coord_caches.borrow_mut();
+                    let cache = caches.entry(wid.clone()).or_insert(ImeCoordCache {
+                        last_valid_rect: Some(raw_rect),
+                        last_raw_rect: Some(raw_rect),
+                        override_active: false,
+                    });
+
+                    if cache.last_valid_rect.is_none() {
+                        debug!(
+                            "[IME-Cache-Debug] [Initialization] Window ID: {:?}, Initialize last valid rect as raw_rect={:?}",
+                            wid, raw_rect
+                        );
+                        cache.last_valid_rect = Some(raw_rect);
+                    }
+
+                    let resolved = if cache.override_active {
+                        if let Some(last) = cache.last_raw_rect {
+                            if raw_rect != last {
+                                debug!(
+                                    "[IME-Cache-Debug] [Stabilized] Window ID: {:?}, raw_rect changed from {:?} to {:?}. Releasing override lock!",
+                                    wid, last, raw_rect
+                                );
+                                cache.override_active = false;
+                                cache.last_valid_rect = Some(raw_rect);
+                                cache.last_raw_rect = Some(raw_rect);
+                                raw_rect
+                            } else {
+                                cache.last_raw_rect = Some(raw_rect);
+                                debug!(
+                                    "[IME-Cache-Debug] [Override active] Window ID: {:?}, Intercepted unchanged raw_rect {:?}, replacing with cached valid rect {:?}",
+                                    wid, raw_rect, cache.last_valid_rect
+                                );
+                                cache.last_valid_rect.unwrap_or(raw_rect)
+                            }
+                        } else {
+                            cache.last_raw_rect = Some(raw_rect);
+                            debug!(
+                                "[IME-Cache-Debug] [Override active] Window ID: {:?}, last_raw_rect is None (empty), raw_rect={:?}, replacing with cached valid rect {:?}",
+                                wid, raw_rect, cache.last_valid_rect
+                            );
+                            cache.last_valid_rect.unwrap_or(raw_rect)
+                        }
+                    } else {
+                        debug!(
+                            "[IME-Cache-Debug] [Process] Window ID: {:?}, override_active={}, raw_rect={:?}",
+                            wid, cache.override_active, raw_rect
+                        );
+
+                        cache.last_raw_rect = Some(raw_rect);
+                        cache.last_valid_rect = Some(raw_rect);
+                        raw_rect
+                    };
+                    resolved
+                } else {
+                    debug!("[IME-Cache-Debug] [Bypass] No Window ID provided for this popup, using raw_rect: {:?}", raw_rect);
+                    raw_rect
+                };
+
                 let mut bbox =
                     utils::bbox_from_surface_tree(popup.wl_surface(), text_input_rectangle.loc)
                         .to_f64();
@@ -1419,7 +1487,7 @@ impl State {
             match &popup {
                 xdg_popup @ PopupKind::Xdg(popup) => {
                     if popup.with_pending_state(|state| state.positioner.reactive) {
-                        self.unconstrain_window_popup(xdg_popup, window);
+                        self.unconstrain_window_popup(xdg_popup, window, None);
                         if let Err(err) = popup.send_pending_configure() {
                             warn!("error re-configuring reactive popup: {err:?}");
                         }
